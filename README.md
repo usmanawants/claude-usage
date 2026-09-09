@@ -134,7 +134,9 @@ Claude Code writes one JSONL file per session to `~/.claude/projects/`. Each lin
 - `message.usage.cache_read_input_tokens` — tokens served from prompt cache
 - `message.model` — the model used (e.g. `claude-sonnet-4-6`)
 
-`scanner.py` parses those files and stores the data in a SQLite database at `~/.claude/usage.db`.
+`scanner.py` parses those files and stores the data in a SQLite database at `~/.claude/usage.db`. It also records the text of each **user prompt** and links every assistant turn to the prompt that triggered it, which is what powers the per-prompt cost breakdown — click any row in **Recent Sessions** to see each prompt in that session with the tokens and estimated cost it ran up.
+
+Prompt text stays on your machine (it is only ever read from your own transcripts and written to your own database), but if you'd rather the database held token metadata only, set `CLAUDE_USAGE_CAPTURE_PROMPTS=0` before scanning. Token accounting is identical either way; only the text is withheld. To purge prompts already stored, delete `~/.claude/usage.db` and rescan with the variable set.
 
 `dashboard.py` serves a single-page dashboard on `localhost:8080` with Chart.js charts (loaded from CDN). It auto-refreshes every 30 seconds and supports model filtering and a date-range dropdown with bookmarkable URLs. A sticky section nav jumps between sections, and every chart/table can be collapsed (remembered across reloads). The bind address and port can be configured with the `--host` and `--port` flags, or the `HOST` and `PORT` environment variables (defaults: `localhost`, `8080`).
 

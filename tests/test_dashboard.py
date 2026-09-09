@@ -6,11 +6,12 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
-from scanner import get_db, init_db, upsert_sessions, insert_turns
-from dashboard import get_dashboard_data, DashboardHandler, HTML_TEMPLATE
+from scanner import get_db, init_db, upsert_sessions, insert_turns, insert_prompts
+from dashboard import get_dashboard_data, get_session_details, DashboardHandler, HTML_TEMPLATE
 
 try:
     from http.server import HTTPServer
@@ -50,6 +51,14 @@ class TestGetDashboardData(unittest.TestCase):
                 "cache_creation_tokens": 0, "tool_name": None, "cwd": "/tmp",
             },
         ]
+        insert_prompts(conn, [{
+            "uuid": "prompt-1", "session_id": "sess-abc123",
+            "timestamp": "2026-04-08T09:29:00Z", "text": "fix the bug",
+            "char_count": 11, "truncated": 0, "is_subagent": 0,
+            "agent_id": None,
+        }])
+        for t in turns:
+            t["prompt_uuid"] = "prompt-1"
         insert_turns(conn, turns)
         conn.commit()
         conn.close()
@@ -100,6 +109,59 @@ class TestGetDashboardData(unittest.TestCase):
         session = data["sessions_all"][0]
         # 1 hour = 60 minutes
         self.assertEqual(session["duration_min"], 60.0)
+
+    def test_session_details_groups_turns_under_their_prompt(self):
+        data = get_session_details("sess-abc123", db_path=self.db_path)
+        self.assertEqual(data["session"]["session_id"], "sess-abc123")
+        self.assertEqual(data["session"]["prompt_count"], 1)
+        self.assertEqual(len(data["prompts"]), 1)
+        prompt = data["prompts"][0]
+        self.assertEqual(prompt["text"], "fix the bug")
+        self.assertEqual(len(prompt["turns"]), 2)
+        self.assertEqual(prompt["turns"][0]["input"], 500)
+        self.assertEqual(prompt["turns"][0]["output"], 200)
+        self.assertEqual(prompt["turns"][1]["input"], 300)
+        self.assertEqual(prompt["turns"][1]["output"], 150)
+
+    def test_session_details_keeps_unlinked_turns_in_a_null_prompt_group(self):
+        """Turns predating prompt capture still have to show up somewhere."""
+        conn = get_db(self.db_path)
+        insert_turns(conn, [{
+            "session_id": "sess-abc123", "timestamp": "2026-04-08T15:00:00Z",
+            "model": "claude-sonnet-4-6", "input_tokens": 111,
+            "output_tokens": 22, "cache_read_tokens": 0,
+            "cache_creation_tokens": 0, "tool_name": None, "cwd": "/tmp",
+            "message_id": "msg-orphan",
+        }])
+        conn.commit()
+        conn.close()
+
+        data = get_session_details("sess-abc123", db_path=self.db_path)
+        self.assertEqual(len(data["prompts"]), 2)
+        orphan_group = data["prompts"][-1]
+        self.assertIsNone(orphan_group["uuid"])
+        self.assertEqual(len(orphan_group["turns"]), 1)
+        self.assertEqual(orphan_group["turns"][0]["input"], 111)
+
+    def test_session_details_truncated_prompt_reports_full_length(self):
+        conn = get_db(self.db_path)
+        insert_prompts(conn, [{
+            "uuid": "p-long", "session_id": "sess-abc123",
+            "timestamp": "2026-04-08T11:00:00Z", "text": "x" * 10,
+            "char_count": 900, "truncated": 1, "is_subagent": 0,
+            "agent_id": None,
+        }])
+        conn.commit()
+        conn.close()
+
+        data = get_session_details("sess-abc123", db_path=self.db_path)
+        long_prompt = [p for p in data["prompts"] if p["uuid"] == "p-long"][0]
+        self.assertTrue(long_prompt["truncated"])
+        self.assertEqual(long_prompt["char_count"], 900)
+
+    def test_session_details_missing_session(self):
+        data = get_session_details("missing", db_path=self.db_path)
+        self.assertEqual(data["error"], "Session not found")
 
     def test_hourly_by_model_present(self):
         data = get_dashboard_data(db_path=self.db_path)
@@ -318,6 +380,48 @@ class TestDashboardHTTP(unittest.TestCase):
             data = json.loads(resp.read())
             # Should have expected keys (or error if no DB)
             self.assertTrue("all_models" in data or "error" in data)
+
+    def test_api_session_details_endpoint(self):
+        import dashboard as _d
+        conn = get_db(_d.DB_PATH)
+        init_db(conn)
+        upsert_sessions(conn, [{
+            "session_id": "sess-http", "project_name": "user/proj",
+            "first_timestamp": "2026-04-08T09:00:00Z",
+            "last_timestamp": "2026-04-08T09:10:00Z",
+            "git_branch": "main", "model": "claude-sonnet-4-6",
+            "total_input_tokens": 10, "total_output_tokens": 5,
+            "total_cache_read": 0, "total_cache_creation": 0, "turn_count": 1,
+        }])
+        insert_prompts(conn, [{
+            "uuid": "http-p1", "session_id": "sess-http",
+            "timestamp": "2026-04-08T09:00:30Z", "text": "make it faster",
+            "char_count": 14, "truncated": 0, "is_subagent": 0, "agent_id": None,
+        }])
+        insert_turns(conn, [{
+            "session_id": "sess-http", "timestamp": "2026-04-08T09:01:00Z",
+            "model": "claude-sonnet-4-6", "input_tokens": 10, "output_tokens": 5,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+            "tool_name": None, "cwd": "/tmp", "message_id": "msg-http",
+            "prompt_uuid": "http-p1",
+        }])
+        conn.commit()
+        conn.close()
+
+        url = f"http://127.0.0.1:{self.port}/api/sessions/sess-http"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn("application/json", resp.headers["Content-Type"])
+            data = json.loads(resp.read())
+        self.assertEqual(data["session"]["session_id"], "sess-http")
+        self.assertEqual(data["prompts"][0]["text"], "make it faster")
+        self.assertEqual(len(data["prompts"][0]["turns"]), 1)
+
+    def test_api_session_details_unknown_session_404s(self):
+        url = f"http://127.0.0.1:{self.port}/api/sessions/nope"
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(url)
+        self.assertEqual(ctx.exception.code, 404)
 
     def test_api_rescan_returns_json(self):
         url = f"http://127.0.0.1:{self.port}/api/rescan"

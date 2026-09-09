@@ -55,6 +55,7 @@ By default the scanner walks both `~/.claude/projects/` and the Xcode coding-ass
 - **`turns`** — one row per assistant API response. The source of truth for tokens and per-model attribution.
 - **`sessions`** — aggregated per session (denormalized totals + chosen primary model).
 - **`processed_files`** — incremental-scan tracking: `(path, mtime, lines)`. A file is skipped if its mtime matches; if it grew, only lines past the stored `lines` count are processed.
+- **`prompts`** — one row per user prompt (`uuid` PK, text, char_count, truncated). `turns.prompt_uuid` points at the prompt a turn was produced for, which is what the dashboard's per-prompt cost breakdown groups on.
 
 A conditional unique index on `turns.message_id` (where non-empty) lets `INSERT OR IGNORE` cheaply dedupe replays across rescans.
 
@@ -66,7 +67,11 @@ These three things will bite you if you don't know them:
 
 2. **Session totals are recomputed from `turns` at the end of `scan()`.** During an incremental scan `upsert_sessions` adds tokens additively, but `insert_turns` uses `INSERT OR IGNORE` against the `message_id` unique index — so if a turn is a duplicate, session totals would drift. The final `UPDATE sessions ... (SELECT SUM ... FROM turns)` block reconciles this. Preserve it if you refactor scan logic.
 
-3. **Session primary model priority is opus > sonnet > haiku** (`_model_priority` in [scanner.py](scanner.py)). This prevents a subagent's haiku turn from overwriting the session's opus model when an existing session is updated. Per-turn model is always honored in the `turns` table; only the session-level summary uses the priority.
+3. **Prompt capture is opt-out and turn inserts are an upsert.** `insert_turns` uses `INSERT ... ON CONFLICT(message_id) DO UPDATE` that only ever fills in a missing `prompt_uuid` — never tokens. That's deliberate: adding the `prompt_uuid` column to an existing DB clears `processed_files` to force one full re-read, and the re-read has to link old turns *without* double-counting their tokens. If you make that conflict clause write anything else, a rescan will inflate every total. Prompt text is skipped entirely when `CLAUDE_USAGE_CAPTURE_PROMPTS=0`, but turns are still linked, so token attribution works with or without the text.
+
+4. **Both scan paths go through `parse_jsonl_file`.** The incremental branch passes `skip_lines`; it used to carry a duplicate copy of the parser, and the two drifted. A turn whose prompt arrived in an earlier chunk gets no link from the parser, so `link_orphan_turns` resolves those from the DB at the end of `scan()` — keep it if you refactor.
+
+5. **Session primary model priority is opus > sonnet > haiku** (`_model_priority` in [scanner.py](scanner.py)). This prevents a subagent's haiku turn from overwriting the session's opus model when an existing session is updated. Per-turn model is always honored in the `turns` table; only the session-level summary uses the priority.
 
 ### Cost calculation
 
@@ -82,6 +87,7 @@ Pricing is duplicated in two places that **must stay in sync**:
 
 `http.server.BaseHTTPRequestHandler`-based, two endpoints:
 - `GET /api/data` → JSON snapshot from `get_dashboard_data()`. Returns *all* history; client-side filters by date range and model.
+- `GET /api/sessions/<session_id>` → JSON for one session: its prompts, and the turns grouped under each. 404s with `{"error": ...}` for an unknown session.
 - `POST /api/rescan` → deletes the DB and runs a full rescan. Passes `db_path` and `projects_dirs` explicitly so tests that monkey-patch the module globals work — scan's default arg values are frozen at def time, so don't switch to bare defaults.
 
 The entire UI lives in `HTML_TEMPLATE` as a raw string. Chart.js is loaded from CDN.

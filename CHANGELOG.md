@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.6.0 — TBD
+
+### Dashboard
+
+- **Recent Sessions rows are now clickable**, opening a session detail dialog that breaks the session down **prompt by prompt**: the text of each prompt, the turns it produced (expandable), and the input / output / cache tokens and estimated cost attributed to it. Cost is summed per turn, so a prompt whose work spanned models (a haiku subagent under an opus thread) is priced correctly.
+- New `GET /api/sessions/<session_id>` endpoint backing the dialog. Turns that predate prompt capture, or that have no user prompt in the transcript, are grouped under a trailing prompt-less entry so no tokens go missing from the breakdown.
+
+### Scanner
+
+- The scanner now records **user prompt text** in a new `prompts` table and links every assistant turn to the prompt that triggered it (`turns.prompt_uuid`), which is what makes per-prompt token attribution possible. Harness-injected blocks (system reminders, IDE context) are stripped, tool results and meta records are not treated as prompts, and prompts longer than 20,000 characters are truncated (the full length is still recorded).
+- Prompt capture is **opt-out**: set `CLAUDE_USAGE_CAPTURE_PROMPTS=0` to keep the database token-metadata-only. Token accounting is unaffected either way — turns are still linked, only the text is withheld.
+- Existing databases migrate automatically: adding the link column forces one full re-read of the transcripts, and `insert_turns` now upserts on `message_id` so the re-read fills in prompt links without duplicating turns or double-counting tokens.
+- `parse_jsonl_file` gained a `skip_lines` argument and is now used by **both** scan paths. The incremental branch of `scan()` no longer carries its own copy of the parsing logic, so the two can't drift apart.
+
 ## v1.5.5 — 2026-07-10
 
 ### Dashboard
