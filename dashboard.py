@@ -6,7 +6,7 @@ import json
 import os
 import sqlite3
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from pathlib import Path
 from datetime import datetime
 
@@ -232,6 +232,109 @@ def get_dashboard_data(db_path=DB_PATH):
     }
 
 
+def get_session_details(session_id, db_path=DB_PATH):
+    """Return one session, its prompts, and the turns each prompt produced.
+
+    Turns are grouped under the prompt that triggered them (scanner links them
+    via turns.prompt_uuid). Turns from before prompt capture existed — or from
+    a stream with no user prompt at all — land in a trailing group whose prompt
+    is null, so no token ever goes missing from the total.
+    """
+    if not db_path.exists():
+        return {"error": "Database not found. Run: python cli.py scan"}
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    init_db(conn)
+
+    session = conn.execute("""
+        SELECT session_id, project_name, first_timestamp, last_timestamp,
+               git_branch, model, topic, turn_count,
+               total_input_tokens, total_output_tokens,
+               total_cache_read, total_cache_creation
+        FROM sessions
+        WHERE session_id = ?
+    """, (session_id,)).fetchone()
+    if session is None:
+        conn.close()
+        return {"error": "Session not found"}
+
+    prompts = conn.execute("""
+        SELECT uuid, timestamp, text, char_count, truncated, is_subagent
+        FROM prompts
+        WHERE session_id = ?
+        ORDER BY timestamp, rowid
+    """, (session_id,)).fetchall()
+
+    turns = conn.execute("""
+        SELECT timestamp, model, input_tokens, output_tokens,
+               cache_read_tokens, cache_creation_tokens,
+               tool_name, is_subagent, agent_id, prompt_uuid
+        FROM turns
+        WHERE session_id = ?
+        ORDER BY timestamp, id
+    """, (session_id,)).fetchall()
+    conn.close()
+
+    def turn_json(r):
+        return {
+            "timestamp": r["timestamp"] or "",
+            "model": r["model"] or "unknown",
+            "input": r["input_tokens"] or 0,
+            "output": r["output_tokens"] or 0,
+            "cache_read": r["cache_read_tokens"] or 0,
+            "cache_creation": r["cache_creation_tokens"] or 0,
+            "tool_name": r["tool_name"] or "",
+            "is_subagent": bool(r["is_subagent"]),
+            "agent_id": r["agent_id"] or "",
+        }
+
+    groups = []
+    by_uuid = {}
+    for p in prompts:
+        group = {
+            "uuid": p["uuid"],
+            "timestamp": p["timestamp"] or "",
+            "text": p["text"] or "",
+            "char_count": p["char_count"] or 0,
+            "truncated": bool(p["truncated"]),
+            "is_subagent": bool(p["is_subagent"]),
+            "turns": [],
+        }
+        by_uuid[p["uuid"]] = group
+        groups.append(group)
+
+    orphans = []
+    for r in turns:
+        group = by_uuid.get(r["prompt_uuid"])
+        (group["turns"] if group else orphans).append(turn_json(r))
+    if orphans:
+        groups.append({
+            "uuid": None, "timestamp": "", "text": "", "char_count": 0,
+            "truncated": False, "is_subagent": False, "turns": orphans,
+        })
+
+    return {
+        "session": {
+            "session_id": session["session_id"],
+            "project": session["project_name"] or "unknown",
+            "branch": session["git_branch"] or "",
+            "topic": session["topic"] or "",
+            "first": session["first_timestamp"] or "",
+            "last": session["last_timestamp"] or "",
+            "model": session["model"] or "unknown",
+            "turns": session["turn_count"] or 0,
+            "input": session["total_input_tokens"] or 0,
+            "output": session["total_output_tokens"] or 0,
+            "cache_read": session["total_cache_read"] or 0,
+            "cache_creation": session["total_cache_creation"] or 0,
+            "prompt_count": len(prompts),
+        },
+        "prompts": groups,
+    }
+
+
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -375,6 +478,33 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .show-more-btn:hover { color: var(--text); border-color: var(--accent); }
   .show-more-link { color: var(--blue); text-decoration: none; font-size: 12px; cursor: pointer; }
   .show-more-link:hover { text-decoration: underline; }
+  .session-row { cursor: pointer; }
+  .session-dialog { width: min(1100px, calc(100vw - 32px)); max-height: calc(100vh - 48px); overflow: auto; background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+  .session-dialog::backdrop { background: rgba(0,0,0,0.65); }
+  .session-dialog-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 16px; }
+  .session-dialog h2 { font-size: 18px; color: var(--text); overflow-wrap: anywhere; }
+  .session-dialog-meta { color: var(--muted); font-size: 12px; margin-top: 5px; }
+  .dialog-close { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 5px; padding: 4px 9px; cursor: pointer; }
+  .dialog-close:hover { color: var(--text); border-color: var(--accent); }
+  .session-summary { display: flex; flex-wrap: wrap; gap: 18px; padding: 12px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+  .session-summary-item .label { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+  .session-summary-item .value { color: var(--text); font-family: monospace; margin-top: 3px; }
+  .session-turns { width: 100%; }
+  .session-turns th, .session-turns td { padding: 6px 8px; font-size: 12px; }
+  .session-turns .timestamp { white-space: nowrap; }
+  .dialog-loading { color: var(--muted); padding: 20px 0; }
+  .prompt-card { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 10px; overflow: hidden; }
+  .prompt-head { display: flex; gap: 12px; padding: 12px; cursor: pointer; align-items: flex-start; }
+  .prompt-head:hover { background: var(--bg); }
+  .prompt-caret { color: var(--muted); font-size: 11px; padding-top: 2px; }
+  .prompt-body { flex: 1; min-width: 0; }
+  .prompt-meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--muted); font-size: 11px; margin-bottom: 6px; }
+  .prompt-text { color: var(--text); font-size: 13px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 7.5em; overflow: hidden; }
+  .prompt-card.open .prompt-text { max-height: none; }
+  .prompt-tokens { text-align: right; white-space: nowrap; }
+  .prompt-tokens .value { font-family: monospace; color: var(--text); }
+  .prompt-tokens .sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .prompt-turns { border-top: 1px solid var(--border); overflow-x: auto; }
 
   footer { border-top: 1px solid var(--border); padding: 20px 24px; margin-top: 8px; }
   .footer-content { max-width: 1400px; margin: 0 auto; }
@@ -586,6 +716,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </table>
     <div class="table-foot" id="sessions-foot"></div>
   </div>
+  <dialog id="session-dialog" class="session-dialog">
+    <div class="session-dialog-header">
+      <div><h2 id="session-dialog-title">Session details</h2><div id="session-dialog-meta" class="session-dialog-meta"></div></div>
+      <button class="dialog-close" onclick="closeSessionDetails()" aria-label="Close session details">Close</button>
+    </div>
+    <div id="session-dialog-content" class="dialog-loading">Loading...</div>
+  </dialog>
   <div class="table-card" id="sec-cost-project" data-card="cost-by-project">
     <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Cost by Project</div><button class="export-btn" onclick="exportProjectsCSV()" title="Export all projects to CSV">&#x2913; CSV</button></div>
     <table>
@@ -1660,7 +1797,7 @@ function renderSessionsTable(sessions) {
     const titleCell = s.topic
       ? `<td class="topic-cell" title="${esc(s.topic)}">${esc(s.topic)}</td>`
       : `<td class="topic-cell"><span class="untitled">Untitled</span></td>`;
-    return `<tr>
+    return `<tr class="session-row" onclick="openSessionDetails('${esc(s.session_id)}')" title="Click for prompt-by-prompt detail">
       <td class="muted" style="font-family:monospace">${esc(s.session_id.slice(0, 8))}&hellip;</td>
       <td>${esc(s.project)}</td>
       ${titleCell}
@@ -1674,6 +1811,124 @@ function renderSessionsTable(sessions) {
     </tr>`;
   }).join('');
   renderTableToggle('sessions-foot', sessions.length, sessionsLimit, 'lessSessionRows', 'moreSessionRows', 'exportSessionsCSV');
+}
+
+async function openSessionDetails(sessionId) {
+  const dialog = document.getElementById('session-dialog');
+  const content = document.getElementById('session-dialog-content');
+  document.getElementById('session-dialog-title').textContent = 'Session details';
+  document.getElementById('session-dialog-meta').textContent = sessionId;
+  content.innerHTML = '<div class="dialog-loading">Loading&hellip;</div>';
+  dialog.showModal();
+  try {
+    const resp = await fetch('/api/sessions/' + encodeURIComponent(sessionId));
+    const data = await resp.json();
+    if (!resp.ok || data.error) throw new Error(data.error || 'Unable to load session');
+    const s = data.session;
+    document.getElementById('session-dialog-title').textContent = s.topic || 'Untitled session';
+    document.getElementById('session-dialog-meta').textContent =
+      [s.project, s.branch, s.model, s.first ? s.first + ' → ' + s.last : ''].filter(Boolean).join(' · ');
+    content.innerHTML = `
+      <div class="session-summary">
+        ${sessionSummaryItem('Prompts', fmt(s.prompt_count))}
+        ${sessionSummaryItem('Turns', fmt(s.turns))}
+        ${sessionSummaryItem('Input', fmt(s.input))}
+        ${sessionSummaryItem('Output', fmt(s.output))}
+        ${sessionSummaryItem('Cache read', fmt(s.cache_read))}
+        ${sessionSummaryItem('Cache creation', fmt(s.cache_creation))}
+        ${sessionSummaryItem('Est. cost', fmtCost(sessionCost(data.prompts)))}
+      </div>
+      ${data.prompts.length
+        ? data.prompts.map((p, i) => renderPromptCard(p, i)).join('')
+        : `<div class="dialog-loading">No prompts recorded for this session. Prompt text is captured from Claude Code transcripts on scan &mdash; run <code>python cli.py scan</code> to backfill.</div>`}`;
+  } catch (error) {
+    content.innerHTML = '<div class="dialog-loading">' + esc(error.message) + '</div>';
+  }
+}
+
+// Sum the per-turn costs of every prompt group. Cost is always computed per
+// turn because a single prompt can span models (a subagent on haiku under an
+// opus main thread), and a blended rate would be wrong.
+function promptTokens(p) {
+  return p.turns.reduce((a, t) => ({
+    input: a.input + t.input,
+    output: a.output + t.output,
+    cache_read: a.cache_read + t.cache_read,
+    cache_creation: a.cache_creation + t.cache_creation,
+    cost: a.cost + (isBillable(t.model) ? calcCost(t.model, t.input, t.output, t.cache_read, t.cache_creation) : 0),
+    billable: a.billable || isBillable(t.model),
+  }), { input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0, billable: false });
+}
+
+function sessionCost(prompts) {
+  return prompts.reduce((sum, p) => sum + promptTokens(p).cost, 0);
+}
+
+function renderPromptCard(p, i) {
+  const t = promptTokens(p);
+  const total = t.input + t.output + t.cache_read + t.cache_creation;
+  const models = [...new Set(p.turns.map(x => x.model))];
+  const header = p.uuid
+    ? `<div class="prompt-text">${esc(p.text)}${p.truncated ? `<span class="muted"> … (truncated, ${fmt(p.char_count)} chars)</span>` : ''}</div>`
+    : `<div class="prompt-text muted">Turns not attributed to a prompt (recorded before prompt capture, or with no user prompt in the transcript).</div>`;
+  return `
+    <div class="prompt-card">
+      <div class="prompt-head" onclick="togglePromptTurns(${i})">
+        <span class="prompt-caret" id="prompt-caret-${i}">&#9656;</span>
+        <div class="prompt-body">
+          <div class="prompt-meta">
+            ${p.timestamp ? `<span>${esc(p.timestamp.replace('T', ' ').replace('Z', ''))}</span>` : ''}
+            ${p.is_subagent ? '<span class="model-tag">subagent</span>' : ''}
+            ${models.map(m => `<span class="model-tag">${esc(m)}</span>`).join('')}
+            <span>${fmt(p.turns.length)} turn${p.turns.length === 1 ? '' : 's'}</span>
+          </div>
+          ${header}
+        </div>
+        <div class="prompt-tokens">
+          <div class="value">${fmt(total)} tok</div>
+          <div class="sub">${fmt(t.input)} in · ${fmt(t.output)} out · ${fmt(t.cache_read + t.cache_creation)} cache</div>
+          <div class="${t.billable ? 'cost' : 'cost-na'}">${t.billable ? fmtCost(t.cost) : 'n/a'}</div>
+        </div>
+      </div>
+      <div class="prompt-turns" id="prompt-turns-${i}" hidden>
+        <table class="session-turns">
+          <thead><tr><th>#</th><th>Timestamp</th><th>Model</th><th>Tool</th><th>Input</th><th>Output</th><th>Cache read</th><th>Cache creation</th><th>Type</th><th>Est. cost</th></tr></thead>
+          <tbody>${p.turns.map((x, n) => {
+            const cost = calcCost(x.model, x.input, x.output, x.cache_read, x.cache_creation);
+            return `<tr>
+              <td class="num">${n + 1}</td>
+              <td class="timestamp muted">${esc(x.timestamp.replace('T', ' ').replace('Z', ''))}</td>
+              <td><span class="model-tag">${esc(x.model)}</span></td>
+              <td class="muted">${esc(x.tool_name || '—')}</td>
+              <td class="num">${fmt(x.input)}</td>
+              <td class="num">${fmt(x.output)}</td>
+              <td class="num">${fmt(x.cache_read)}</td>
+              <td class="num">${fmt(x.cache_creation)}</td>
+              <td class="muted">${x.is_subagent ? 'Subagent' : 'Main'}</td>
+              <td class="${isBillable(x.model) ? 'cost' : 'cost-na'}">${isBillable(x.model) ? fmtCost(cost) : 'n/a'}</td>
+            </tr>`;
+          }).join('')}</tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+function togglePromptTurns(i) {
+  const turns = document.getElementById('prompt-turns-' + i);
+  const caret = document.getElementById('prompt-caret-' + i);
+  turns.hidden = !turns.hidden;
+  caret.innerHTML = turns.hidden ? '&#9656;' : '&#9662;';
+  // The collapsed card clamps long prompts to a few lines; opening it shows
+  // the whole thing alongside the per-turn breakdown.
+  turns.closest('.prompt-card').classList.toggle('open', !turns.hidden);
+}
+
+function sessionSummaryItem(label, value) {
+  return `<div class="session-summary-item"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`;
+}
+
+function closeSessionDetails() {
+  document.getElementById('session-dialog').close();
 }
 
 function setModelSort(col) {
@@ -2242,6 +2497,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             data = get_dashboard_data(DB_PATH)
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif path.startswith("/api/sessions/"):
+            session_id = unquote(path[len("/api/sessions/"):])
+            data = get_session_details(session_id, DB_PATH)
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(200 if "error" not in data else 404)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()

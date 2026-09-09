@@ -2,11 +2,13 @@
 
 import json
 import os
+import time
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
+import scanner
 from scanner import (
     get_db, init_db, project_name_from_cwd, parse_jsonl_file,
     aggregate_sessions, upsert_sessions, insert_turns, scan,
@@ -76,13 +78,15 @@ def _make_user_record(session_id="sess-1", timestamp="2026-04-08T09:59:00Z",
 
 def _make_user_record_with_text(session_id="sess-1", text="Please fix the bug",
                                 timestamp="2026-04-08T09:59:00Z",
-                                cwd="/home/user/project"):
+                                cwd="/home/user/project", uuid="u-1", **extra):
     return json.dumps({
         "type": "user",
         "sessionId": session_id,
         "timestamp": timestamp,
         "cwd": cwd,
+        "uuid": uuid,
         "message": {"content": [{"type": "text", "text": text}]},
+        **extra,
     })
 
 
@@ -118,7 +122,7 @@ class TestParseJsonlFile(unittest.TestCase):
             _make_user_record(),
             _make_assistant_record(),
         ])
-        metas, turns, _, line_count = parse_jsonl_file(path)
+        metas, turns, _, _, line_count = parse_jsonl_file(path)
         self.assertEqual(len(metas), 1)
         self.assertEqual(len(turns), 1)
         self.assertEqual(metas[0]["session_id"], "sess-1")
@@ -131,7 +135,7 @@ class TestParseJsonlFile(unittest.TestCase):
             _make_assistant_record(input_tokens=0, output_tokens=0,
                                    cache_read=0, cache_creation=0),
         ])
-        _, turns, _, _ = parse_jsonl_file(path)
+        _, turns, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 0)
 
     def test_skips_non_assistant_user_types(self):
@@ -139,7 +143,7 @@ class TestParseJsonlFile(unittest.TestCase):
             json.dumps({"type": "system", "sessionId": "s1"}),
             _make_assistant_record(session_id="s1"),
         ])
-        metas, turns, _, _ = parse_jsonl_file(path)
+        metas, turns, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 1)
 
     def test_handles_malformed_json(self):
@@ -147,12 +151,12 @@ class TestParseJsonlFile(unittest.TestCase):
             "not valid json",
             _make_assistant_record(),
         ])
-        _, turns, _, _ = parse_jsonl_file(path)
+        _, turns, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 1)
 
     def test_handles_empty_file(self):
         path = self._write_jsonl("test.jsonl", [])
-        metas, turns, _, _ = parse_jsonl_file(path)
+        metas, turns, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(metas), 0)
         self.assertEqual(len(turns), 0)
 
@@ -161,7 +165,7 @@ class TestParseJsonlFile(unittest.TestCase):
             _make_assistant_record(session_id="s1"),
             _make_assistant_record(session_id="s2"),
         ])
-        metas, turns, _, _ = parse_jsonl_file(path)
+        metas, turns, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(metas), 2)
         self.assertEqual(len(turns), 2)
 
@@ -171,7 +175,7 @@ class TestParseJsonlFile(unittest.TestCase):
             _make_assistant_record(timestamp="2026-04-08T09:05:00Z"),
             _make_assistant_record(timestamp="2026-04-08T09:10:00Z"),
         ])
-        metas, _, _, _ = parse_jsonl_file(path)
+        metas, _, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(metas[0]["first_timestamp"], "2026-04-08T09:00:00Z")
         self.assertEqual(metas[0]["last_timestamp"], "2026-04-08T09:10:00Z")
 
@@ -190,7 +194,7 @@ class TestParseJsonlFile(unittest.TestCase):
             },
         })
         path = self._write_jsonl("test.jsonl", [record])
-        _, turns, _, _ = parse_jsonl_file(path)
+        _, turns, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(turns[0]["tool_name"], "Read")
 
 
@@ -217,7 +221,7 @@ class TestMessageIdDedup(unittest.TestCase):
             # Streaming event 3: final usage (same message)
             _make_assistant_record(message_id="msg-abc", input_tokens=150, output_tokens=80),
         ])
-        _, turns, _, _ = parse_jsonl_file(path)
+        _, turns, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 1)
         # Last record wins (has final tallies)
         self.assertEqual(turns[0]["input_tokens"], 150)
@@ -230,7 +234,7 @@ class TestMessageIdDedup(unittest.TestCase):
             _make_assistant_record(message_id="msg-1", input_tokens=100),
             _make_assistant_record(message_id="msg-2", input_tokens=200),
         ])
-        _, turns, _, _ = parse_jsonl_file(path)
+        _, turns, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 2)
 
     def test_records_without_message_id_kept(self):
@@ -239,7 +243,7 @@ class TestMessageIdDedup(unittest.TestCase):
             _make_assistant_record(input_tokens=100),
             _make_assistant_record(input_tokens=200),
         ])
-        _, turns, _, _ = parse_jsonl_file(path)
+        _, turns, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 2)
 
     def test_mixed_with_and_without_ids(self):
@@ -249,7 +253,7 @@ class TestMessageIdDedup(unittest.TestCase):
             _make_assistant_record(message_id="msg-1", input_tokens=100),  # deduped
             _make_assistant_record(input_tokens=200),  # no id, kept
         ])
-        _, turns, _, _ = parse_jsonl_file(path)
+        _, turns, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(len(turns), 2)  # 1 deduped + 1 without id
         token_sums = sorted([t["input_tokens"] for t in turns])
         self.assertEqual(token_sums, [100, 200])
@@ -693,14 +697,14 @@ class TestParseJsonlFileLineCount(unittest.TestCase):
             f.write(_make_user_record() + "\n")
             f.write(_make_assistant_record() + "\n")
             f.write(_make_assistant_record(timestamp="2026-04-08T10:01:00Z") + "\n")
-        _, _, _, line_count = parse_jsonl_file(path)
+        _, _, _, _, line_count = parse_jsonl_file(path)
         self.assertEqual(line_count, 3)
 
     def test_empty_file_returns_zero(self):
         path = os.path.join(self.tmpdir, "empty.jsonl")
         with open(path, "w") as f:
             pass
-        _, _, _, line_count = parse_jsonl_file(path)
+        _, _, _, _, line_count = parse_jsonl_file(path)
         self.assertEqual(line_count, 0)
 
 
@@ -723,7 +727,7 @@ class TestSessionTopic(unittest.TestCase):
             _make_assistant_record(),
             _make_custom_title_record(title="Ship the release"),
         ])
-        metas, _, _, _ = parse_jsonl_file(path)
+        metas, _, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(metas[0]["topic"], "Ship the release")
 
     def test_ai_title_used_when_no_custom(self):
@@ -731,7 +735,7 @@ class TestSessionTopic(unittest.TestCase):
             _make_assistant_record(),
             _make_ai_title_record(title="Debug the crash"),
         ])
-        metas, _, _, _ = parse_jsonl_file(path)
+        metas, _, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(metas[0]["topic"], "Debug the crash")
 
     def test_custom_title_wins_when_it_comes_after_ai_title(self):
@@ -740,7 +744,7 @@ class TestSessionTopic(unittest.TestCase):
             _make_ai_title_record(title="AI guess"),
             _make_custom_title_record(title="User label"),
         ])
-        metas, _, _, _ = parse_jsonl_file(path)
+        metas, _, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(metas[0]["topic"], "User label")
 
     def test_custom_title_not_overridden_by_later_ai_title(self):
@@ -749,7 +753,7 @@ class TestSessionTopic(unittest.TestCase):
             _make_custom_title_record(title="User label"),
             _make_ai_title_record(title="AI guess"),
         ])
-        metas, _, _, _ = parse_jsonl_file(path)
+        metas, _, _, _, _ = parse_jsonl_file(path)
         self.assertEqual(metas[0]["topic"], "User label")
 
     def test_no_title_record_leaves_topic_empty(self):
@@ -759,7 +763,7 @@ class TestSessionTopic(unittest.TestCase):
             _make_user_record_with_text(text="Please fix the login bug"),
             _make_assistant_record(),
         ])
-        metas, _, _, _ = parse_jsonl_file(path)
+        metas, _, _, _, _ = parse_jsonl_file(path)
         self.assertIsNone(metas[0]["topic"])
 
 
@@ -962,6 +966,108 @@ class TestTopicBackfill(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT topic FROM sessions WHERE session_id='keep'").fetchone()[0], "existing")
         self.assertEqual(conn.execute("SELECT topic FROM sessions WHERE session_id='fill'").fetchone()[0], "filled")
         conn.close()
+
+
+class TestPromptCapture(unittest.TestCase):
+    """Prompt text extraction and the turn -> prompt link."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def _write_jsonl(self, filename, lines):
+        path = os.path.join(self.tmpdir, filename)
+        with open(path, "w") as f:
+            for line in lines:
+                f.write(line + "\n")
+        return path
+
+    def test_prompt_text_captured_and_linked_to_following_turns(self):
+        path = self._write_jsonl("t.jsonl", [
+            _make_user_record_with_text(text="add a dark mode", uuid="p1"),
+            _make_assistant_record(),
+        ])
+        _, turns, _, prompts, _ = parse_jsonl_file(path)
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0]["text"], "add a dark mode")
+        self.assertEqual(prompts[0]["uuid"], "p1")
+        self.assertEqual(turns[0]["prompt_uuid"], "p1")
+
+    def test_turns_attach_to_the_most_recent_prompt(self):
+        path = self._write_jsonl("t.jsonl", [
+            _make_user_record_with_text(text="first", uuid="p1"),
+            _make_assistant_record(timestamp="2026-04-08T10:00:00Z"),
+            _make_user_record_with_text(text="second", uuid="p2",
+                                        timestamp="2026-04-08T10:01:00Z"),
+            _make_assistant_record(timestamp="2026-04-08T10:02:00Z"),
+        ])
+        _, turns, _, prompts, _ = parse_jsonl_file(path)
+        self.assertEqual(len(prompts), 2)
+        by_ts = {t["timestamp"]: t["prompt_uuid"] for t in turns}
+        self.assertEqual(by_ts["2026-04-08T10:00:00Z"], "p1")
+        self.assertEqual(by_ts["2026-04-08T10:02:00Z"], "p2")
+
+    def test_injected_blocks_are_stripped(self):
+        text = ("<system-reminder>ignore me</system-reminder>\n"
+                "the real prompt\n"
+                "<ide_opened_file>foo.py</ide_opened_file>")
+        path = self._write_jsonl("t.jsonl", [
+            _make_user_record_with_text(text=text, uuid="p1"),
+        ])
+        _, _, _, prompts, _ = parse_jsonl_file(path)
+        self.assertEqual(prompts[0]["text"], "the real prompt")
+
+    def test_record_that_is_only_injected_context_is_not_a_prompt(self):
+        path = self._write_jsonl("t.jsonl", [
+            _make_user_record_with_text(
+                text="<system-reminder>context only</system-reminder>", uuid="p1"),
+        ])
+        _, _, _, prompts, _ = parse_jsonl_file(path)
+        self.assertEqual(prompts, [])
+
+    def test_tool_results_and_meta_records_are_not_prompts(self):
+        tool_result = json.dumps({
+            "type": "user", "sessionId": "sess-1", "uuid": "tr-1",
+            "timestamp": "2026-04-08T09:59:00Z",
+            "message": {"content": [{"type": "tool_result", "content": "ok"}]},
+        })
+        path = self._write_jsonl("t.jsonl", [
+            tool_result,
+            _make_user_record_with_text(text="meta text", uuid="m-1", isMeta=True),
+        ])
+        _, _, _, prompts, _ = parse_jsonl_file(path)
+        self.assertEqual(prompts, [])
+
+    def test_long_prompt_truncated_but_full_length_recorded(self):
+        long_text = "y" * (scanner.MAX_PROMPT_CHARS + 500)
+        path = self._write_jsonl("t.jsonl", [
+            _make_user_record_with_text(text=long_text, uuid="p1"),
+        ])
+        _, _, _, prompts, _ = parse_jsonl_file(path)
+        self.assertEqual(len(prompts[0]["text"]), scanner.MAX_PROMPT_CHARS)
+        self.assertEqual(prompts[0]["char_count"], scanner.MAX_PROMPT_CHARS + 500)
+        self.assertEqual(prompts[0]["truncated"], 1)
+
+    def test_incremental_scan_links_turns_to_an_earlier_chunks_prompt(self):
+        """The prompt can sit in lines a later scan skips; the link must survive."""
+        db = os.path.join(self.tmpdir, "usage.db")
+        path = self._write_jsonl("t.jsonl", [
+            _make_user_record_with_text(text="keep going", uuid="p1"),
+            _make_assistant_record(timestamp="2026-04-08T10:00:00Z",
+                                   message_id="msg-1"),
+        ])
+        scan(projects_dir=self.tmpdir, db_path=db, verbose=False)
+
+        with open(path, "a") as f:
+            f.write(_make_assistant_record(timestamp="2026-04-08T10:05:00Z",
+                                           message_id="msg-2") + "\n")
+        os.utime(path, (time.time() + 10, time.time() + 10))
+        scan(projects_dir=self.tmpdir, db_path=db, verbose=False)
+
+        conn = get_db(db)
+        links = {r["message_id"]: r["prompt_uuid"]
+                 for r in conn.execute("SELECT message_id, prompt_uuid FROM turns")}
+        conn.close()
+        self.assertEqual(links, {"msg-1": "p1", "msg-2": "p1"})
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ scanner.py - Scans Claude Code JSONL transcript files and stores data in SQLite.
 import json
 import os
 import glob
+import re
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ from datetime import datetime, timezone
 # runtime version has to live here as a constant. Keep this in lockstep with the
 # top CHANGELOG heading and vscode-extension/package.json (a parity test guards
 # all three; see tests/test_version.py).
-VERSION = "1.5.5"
+VERSION = "1.6.0"
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
@@ -77,7 +78,19 @@ def init_db(conn):
             cwd                     TEXT,
             message_id              TEXT,
             is_subagent             INTEGER DEFAULT 0,
-            agent_id                TEXT
+            agent_id                TEXT,
+            prompt_uuid             TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS prompts (
+            uuid            TEXT PRIMARY KEY,
+            session_id      TEXT,
+            timestamp       TEXT,
+            text            TEXT,
+            char_count      INTEGER DEFAULT 0,
+            truncated       INTEGER DEFAULT 0,
+            is_subagent     INTEGER DEFAULT 0,
+            agent_id        TEXT
         );
 
         CREATE TABLE IF NOT EXISTS processed_files (
@@ -106,6 +119,7 @@ def init_db(conn):
         CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
         CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp);
         CREATE INDEX IF NOT EXISTS idx_agents_type ON agents(agent_type);
+        CREATE INDEX IF NOT EXISTS idx_prompts_session ON prompts(session_id);
     """)
     # Add message_id column if upgrading from older schema
     try:
@@ -117,6 +131,19 @@ def init_db(conn):
     _ensure_column(conn, "turns", "agent_id", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_subagent ON turns(is_subagent)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_agent_id ON turns(agent_id)")
+    # Prompt capture (added in a later schema version). Existing turns predate
+    # the link column, and their transcripts are already in processed_files, so
+    # an incremental scan would never revisit them: force a full re-read on the
+    # next scan. insert_turns() upserts on message_id, so re-reading only fills
+    # in prompt_uuid rather than duplicating turns — except for the rare turn
+    # with no message_id, which the unique index can't dedupe, so those are
+    # dropped first and re-inserted by that same re-read.
+    if _ensure_column(conn, "turns", "prompt_uuid", "TEXT"):
+        if conn.execute("SELECT 1 FROM processed_files LIMIT 1").fetchone():
+            conn.execute(
+                "DELETE FROM turns WHERE message_id IS NULL OR message_id = ''")
+            conn.execute("DELETE FROM processed_files")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_prompt ON turns(prompt_uuid)")
     # Session topic (from custom-title / ai-title records; added in a later
     # schema version). The one-time backfill of pre-existing sessions is driven
     # by scan() via the schema_meta 'topic_backfill_done' marker (not by the
@@ -314,22 +341,153 @@ def upsert_agents(conn, agents):
     ])
 
 
-def parse_jsonl_file(filepath):
-    """Parse a JSONL file and return (session_metas, turns, agents, line_count).
+# Prompt capture. The transcripts contain the literal text the user typed, so
+# storing it is opt-out: set CLAUDE_USAGE_CAPTURE_PROMPTS=0 to keep the DB
+# token-metadata-only (existing prompt rows are left alone; delete the DB and
+# rescan to purge them). Long prompts are truncated to bound DB growth.
+CAPTURE_PROMPTS = os.environ.get("CLAUDE_USAGE_CAPTURE_PROMPTS", "1") != "0"
+MAX_PROMPT_CHARS = 20000
+
+# Wrapper blocks Claude Code injects into the user turn that aren't part of what
+# the user actually typed. Stripped before storing so the dashboard shows the
+# prompt, not the harness scaffolding.
+_INJECTED_TAGS = (
+    "system-reminder", "ide_opened_file", "ide_selection",
+    "local-command-caveat", "local-command-stdout", "local-command-stderr",
+)
+_INJECTED_RE = re.compile(
+    r"<(" + "|".join(_INJECTED_TAGS) + r")>.*?</\1>", re.DOTALL)
+
+
+def _record_text(record):
+    """Concatenate the text blocks of a user record's message content."""
+    content = record.get("message", {}).get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = [item.get("text", "") for item in content
+             if isinstance(item, dict) and item.get("type") == "text"]
+    return "\n".join(p for p in parts if p)
+
+
+def extract_prompt(record, source_path=""):
+    """Return a prompt dict for a user-authored record, or None.
+
+    A prompt is a ``user`` record carrying real text: tool results, meta
+    records, and harness-generated notifications don't qualify. Injected
+    wrapper blocks (system reminders, IDE context) are stripped; if nothing is
+    left the record wasn't a prompt at all.
+    """
+    if record.get("type") != "user" or record.get("isMeta"):
+        return None
+    origin = record.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+        return None
+    uuid = record.get("uuid")
+    if not uuid:
+        return None
+
+    text = _INJECTED_RE.sub("", _record_text(record)).strip()
+    if not text:
+        return None
+
+    char_count = len(text)
+    truncated = char_count > MAX_PROMPT_CHARS
+    if truncated:
+        text = text[:MAX_PROMPT_CHARS]
+
+    return {
+        "uuid": uuid,
+        "session_id": record.get("sessionId"),
+        "timestamp": record.get("timestamp", ""),
+        "text": text,
+        "char_count": char_count,
+        "truncated": 1 if truncated else 0,
+        "is_subagent": 1 if is_subagent_record(record, source_path) else 0,
+        "agent_id": record_agent_id(record),
+    }
+
+
+def link_orphan_turns(conn):
+    """Attach turns with no prompt link to the prompt that preceded them.
+
+    An incremental scan reads only the lines a transcript grew by, so its first
+    turns can belong to a prompt that arrived in an earlier chunk — the parser
+    never saw it and left prompt_uuid NULL. Fall back to the latest prompt in
+    the same stream at or before the turn, which is the same rule the parser
+    applies, just resolved from the DB instead of the file.
+    """
+    conn.execute("""
+        UPDATE turns SET prompt_uuid = (
+            SELECT p.uuid FROM prompts p
+            WHERE p.session_id = turns.session_id
+              AND p.is_subagent = turns.is_subagent
+              AND p.timestamp != ''
+              AND p.timestamp <= turns.timestamp
+            ORDER BY p.timestamp DESC
+            LIMIT 1
+        )
+        WHERE prompt_uuid IS NULL AND timestamp != ''
+    """)
+
+
+def _stream_key(record, source_path=""):
+    """Identify the conversation stream a record belongs to.
+
+    A subagent's turns interleave with the parent's in the same session, so
+    keying only by session would attribute a subagent turn to whatever the user
+    last typed. Its own dispatch prompt is the right parent instead.
+    """
+    return (record.get("sessionId"),
+            record_agent_id(record) or
+            ("subagent" if is_subagent_record(record, source_path) else ""))
+
+
+def insert_prompts(conn, prompts):
+    """Insert prompt rows, replacing any earlier row for the same uuid."""
+    if not prompts:
+        return
+    conn.executemany("""
+        INSERT OR REPLACE INTO prompts
+            (uuid, session_id, timestamp, text, char_count, truncated,
+             is_subagent, agent_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, [
+        (p["uuid"], p["session_id"], p["timestamp"], p["text"],
+         p["char_count"], p["truncated"], p["is_subagent"], p.get("agent_id"))
+        for p in prompts
+    ])
+
+
+def parse_jsonl_file(filepath, skip_lines=0):
+    """Parse a JSONL file into (session_metas, turns, agents, prompts, line_count).
 
     Deduplicates streaming events by message.id — Claude Code logs multiple
     JSONL records per API response, all sharing the same message.id. Only the
     last record per message_id is kept (it has the final usage tallies).
+
+    ``skip_lines`` ignores the first N lines, which is how an incremental scan
+    reads only the part of a transcript that has grown since the last scan. The
+    whole file is still walked (line numbers have to be counted), so the
+    returned line_count is always the file's true length.
     """
     seen_messages = {}  # message_id -> turn dict (dedup streaming records)
     turns_no_id = []    # turns without a message_id (kept as-is)
     session_meta = {}   # session_id -> dict
     agents = {}         # agent_id -> dispatch dict
+    prompts = {}        # prompt uuid -> prompt dict
+    # Assistant turns are billed against the prompt that triggered them: the
+    # most recent user prompt in the same stream. Subagents run their own
+    # stream inside the parent session, so they're keyed separately.
+    last_prompt = {}    # (session_id, agent_id or subagent flag) -> prompt uuid
     line_count = 0
 
     try:
         with open(filepath, encoding="utf-8", errors="replace") as f:
             for line_count, line in enumerate(f, 1):
+                if line_count <= skip_lines:
+                    continue
                 line = line.strip()
                 if not line:
                     continue
@@ -371,6 +529,11 @@ def parse_jsonl_file(filepath):
                     dispatch = extract_agent_dispatch(record)
                     if dispatch is not None:
                         agents[dispatch["agent_id"]] = dispatch
+                    prompt = extract_prompt(record, filepath)
+                    if prompt is not None:
+                        last_prompt[_stream_key(record, filepath)] = prompt["uuid"]
+                        if CAPTURE_PROMPTS:
+                            prompts[prompt["uuid"]] = prompt
 
                 timestamp = record.get("timestamp", "")
                 cwd = record.get("cwd", "")
@@ -434,6 +597,7 @@ def parse_jsonl_file(filepath):
                         "message_id": message_id,
                         "is_subagent": 1 if is_subagent_record(record, filepath) else 0,
                         "agent_id": record_agent_id(record),
+                        "prompt_uuid": last_prompt.get(_stream_key(record, filepath)),
                     }
 
                     # Dedup: last record per message_id wins (final usage tallies)
@@ -446,7 +610,8 @@ def parse_jsonl_file(filepath):
         print(f"  Warning: error reading {filepath}: {e}")
 
     turns = turns_no_id + list(seen_messages.values())
-    return list(session_meta.values()), turns, list(agents.values()), line_count
+    return (list(session_meta.values()), turns, list(agents.values()),
+            list(prompts.values()), line_count)
 
 
 def aggregate_sessions(session_metas, turns):
@@ -557,18 +722,25 @@ def upsert_sessions(conn, sessions):
 
 
 def insert_turns(conn, turns):
+    # A replayed turn (same message_id) must not duplicate its tokens, so the
+    # conflict is a no-op for everything the turn already recorded — with one
+    # exception: prompt_uuid is filled in when it's still missing, which is how
+    # turns stored before prompt capture existed get linked on a re-read.
     conn.executemany("""
-        INSERT OR IGNORE INTO turns
+        INSERT INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
              cache_read_tokens, cache_creation_tokens, tool_name, cwd, message_id,
-             is_subagent, agent_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             is_subagent, agent_id, prompt_uuid)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) WHERE message_id IS NOT NULL AND message_id != ''
+        DO UPDATE SET
+            prompt_uuid = COALESCE(turns.prompt_uuid, excluded.prompt_uuid)
     """, [
         (t["session_id"], t["timestamp"], t["model"],
          t["input_tokens"], t["output_tokens"],
          t["cache_read_tokens"], t["cache_creation_tokens"],
          t["tool_name"], t["cwd"], t.get("message_id", ""),
-         t.get("is_subagent", 0), t.get("agent_id"))
+         t.get("is_subagent", 0), t.get("agent_id"), t.get("prompt_uuid"))
         for t in turns
     ])
 
@@ -632,159 +804,34 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
             status = "NEW" if is_new else "UPD"
             print(f"  [{status}] {filepath}")
 
-        if is_new:
-            # New file: full parse (single read, returns line count)
-            session_metas, turns, agents, line_count = parse_jsonl_file(filepath)
-            upsert_agents(conn, agents)
+        # One read either way: a new file is parsed whole, a grown one skips the
+        # lines already processed. Both paths share parse_jsonl_file so prompt
+        # linking and dedup behave identically.
+        old_lines = 0 if is_new else (row["lines"] or 0)
+        session_metas, turns, agents, prompts, line_count = parse_jsonl_file(
+            filepath, skip_lines=old_lines)
 
-            if turns or session_metas:
-                sessions = aggregate_sessions(session_metas, turns)
-                upsert_sessions(conn, sessions)
-                insert_turns(conn, turns)
-                for s in sessions:
-                    total_sessions.add(s["session_id"])
-                total_turns += len(turns)
+        if not is_new and line_count <= old_lines:
+            # File didn't grow (mtime changed but no new content)
+            conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?",
+                         (mtime, filepath))
+            conn.commit()
+            skipped_files += 1
+            continue
+
+        upsert_agents(conn, agents)
+        insert_prompts(conn, prompts)
+
+        if turns or session_metas:
+            sessions = aggregate_sessions(session_metas, turns)
+            upsert_sessions(conn, sessions)
+            insert_turns(conn, turns)
+            for s in sessions:
+                total_sessions.add(s["session_id"])
+            total_turns += len(turns)
+            if is_new:
                 new_files += 1
-
-        else:
-            # Updated file: read once, process only new lines
-            old_lines = row["lines"] if row else 0
-            seen_messages = {}  # message_id -> turn (dedup streaming)
-            turns_no_id = []
-            new_session_metas = {}
-            agents = {}         # agent_id -> dispatch dict
-            line_count = 0
-
-            try:
-                with open(filepath, encoding="utf-8", errors="replace") as f:
-                    for line_count, line in enumerate(f, 1):
-                        if line_count <= old_lines:
-                            continue
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        rtype = record.get("type")
-                        if rtype not in ("assistant", "user", "custom-title", "ai-title"):
-                            continue
-
-                        session_id = record.get("sessionId")
-                        if not session_id:
-                            continue
-
-                        # Extract session title from title records
-                        title = _extract_title(record)
-                        if title:
-                            if session_id not in new_session_metas:
-                                new_session_metas[session_id] = {
-                                    "session_id": session_id,
-                                    "project_name": "unknown",
-                                    "first_timestamp": "",
-                                    "last_timestamp": "",
-                                    "git_branch": "",
-                                    "model": None,
-                                    "topic": None,
-                                }
-                            meta = new_session_metas[session_id]
-                            if rtype == "custom-title":
-                                meta["topic"] = title
-                            elif rtype == "ai-title" and not meta.get("topic"):
-                                meta["topic"] = title
-                            continue
-
-                        if rtype == "user":
-                            dispatch = extract_agent_dispatch(record)
-                            if dispatch is not None:
-                                agents[dispatch["agent_id"]] = dispatch
-
-                        timestamp = record.get("timestamp", "")
-                        cwd = record.get("cwd", "")
-
-                        # Track session metadata from new lines
-                        if session_id not in new_session_metas:
-                            new_session_metas[session_id] = {
-                                "session_id": session_id,
-                                "project_name": project_name_from_cwd(cwd),
-                                "first_timestamp": timestamp,
-                                "last_timestamp": timestamp,
-                                "git_branch": record.get("gitBranch", ""),
-                                "model": None,
-                                "topic": None,
-                            }
-                        else:
-                            meta = new_session_metas[session_id]
-                            if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
-                                meta["last_timestamp"] = timestamp
-                            if timestamp and (not meta["first_timestamp"] or timestamp < meta["first_timestamp"]):
-                                meta["first_timestamp"] = timestamp
-
-                        if rtype == "assistant":
-                            msg = record.get("message", {})
-                            usage = msg.get("usage", {})
-                            model = msg.get("model", "")
-                            message_id = msg.get("id", "")
-
-                            input_tokens = usage.get("input_tokens", 0) or 0
-                            output_tokens = usage.get("output_tokens", 0) or 0
-                            cache_read = usage.get("cache_read_input_tokens", 0) or 0
-                            cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
-
-                            if input_tokens + output_tokens + cache_read + cache_creation == 0:
-                                continue
-
-                            tool_name = None
-                            for item in msg.get("content", []):
-                                if isinstance(item, dict) and item.get("type") == "tool_use":
-                                    tool_name = item.get("name")
-                                    break
-
-                            if model:
-                                new_session_metas[session_id]["model"] = model
-
-                            turn = {
-                                "session_id": session_id,
-                                "timestamp": timestamp,
-                                "model": model,
-                                "input_tokens": input_tokens,
-                                "output_tokens": output_tokens,
-                                "cache_read_tokens": cache_read,
-                                "cache_creation_tokens": cache_creation,
-                                "tool_name": tool_name,
-                                "cwd": cwd,
-                                "message_id": message_id,
-                                "is_subagent": 1 if is_subagent_record(record, filepath) else 0,
-                                "agent_id": record_agent_id(record),
-                            }
-
-                            if message_id:
-                                seen_messages[message_id] = turn
-                            else:
-                                turns_no_id.append(turn)
-            except Exception as e:
-                print(f"  Warning: {e}")
-
-            if line_count <= old_lines:
-                # File didn't grow (mtime changed but no new content)
-                conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?",
-                             (mtime, filepath))
-                conn.commit()
-                skipped_files += 1
-                continue
-
-            new_turns = turns_no_id + list(seen_messages.values())
-            upsert_agents(conn, list(agents.values()))
-
-            if new_turns or new_session_metas:
-                sessions = aggregate_sessions(list(new_session_metas.values()), new_turns)
-                upsert_sessions(conn, sessions)
-                insert_turns(conn, new_turns)
-                for s in sessions:
-                    total_sessions.add(s["session_id"])
-                total_turns += len(new_turns)
+        if not is_new:
             updated_files += 1
 
         # Record file as processed (line_count already known from the single read)
@@ -798,6 +845,7 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
     # This ensures correctness when INSERT OR IGNORE skips duplicate turns
     # but upsert_sessions had already added their tokens additively.
     if new_files or updated_files:
+        link_orphan_turns(conn)
         conn.execute("""
             UPDATE sessions SET
                 total_input_tokens = COALESCE((SELECT SUM(input_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
